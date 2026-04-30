@@ -3,3 +3,9 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Local secrets — only .env.example is committed.
+# Real .env lives on the VM at /opt/pss-supabase-host/.env (mode 600).
+.env
+.env.local
+*.env.local
