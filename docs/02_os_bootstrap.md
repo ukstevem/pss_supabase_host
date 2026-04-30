@@ -64,11 +64,19 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get -y \
 echo "==> 2/7 install hardening tools + guest agent"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   fail2ban ufw unattended-upgrades qemu-guest-agent
+# qemu-guest-agent has no [Install] section — apt installs it but does
+# not start it. Explicitly enable+start so Proxmox can talk to it.
+sudo systemctl enable --now qemu-guest-agent
 
 echo "==> 3/7 set timezone to ${TZ}"
 sudo timedatectl set-timezone "${TZ}"
 
 echo "==> 4/7 SSH hardening (drop-in conf, sshd_config untouched)"
+# Defensive: an apt upgrade in step 1 may have replaced the openssh-server
+# binary, leaving /run/sshd (which the new binary needs for `sshd -t`)
+# absent. Recreate it before validating config.
+sudo mkdir -p /run/sshd
+sudo chmod 0755 /run/sshd
 # Drop-in is idempotent: re-running the script overwrites this one file
 # to the same content. /etc/ssh/sshd_config remains stock.
 sudo tee /etc/ssh/sshd_config.d/00-pss-hardening.conf >/dev/null <<'SSHCONF'

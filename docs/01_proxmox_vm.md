@@ -30,6 +30,23 @@ If step 3 still asks for a password, step 2 didn't take — re-run it, watch the
 
 The same key gets baked into the new Supabase-host VM in section A.2, so once you've done this you can `ssh ubuntu@10.0.0.85` later with no extra setup.
 
+**Find your LAN gateway and DNS.** The values in section 0 below default to `10.0.0.2` (gateway) and `10.0.0.105` (DNS) — the values for *this* author's network. They are almost certainly different on yours. Discover yours **before** running any of the `qm` commands in section A:
+
+```bash
+# Default gateway: the router-facing address your dev workstation sends
+# packets through to reach the Internet
+ipconfig | grep -iE 'default gateway'                        # Windows / Git Bash
+# or
+ip route | awk '/^default/ {print "Default Gateway: " $3}'   # macOS / Linux
+
+# DNS servers
+ipconfig //all | grep -iE 'dns servers'                      # Windows / Git Bash
+# or
+resolvectl status | grep -E 'Current DNS Server|DNS Servers' # macOS / Linux
+```
+
+If your gateway and DNS are not `10.0.0.2` / `10.0.0.105`, **edit the values in section 0's table and section A.2's `--ipconfig0` and `--nameserver` flags before running anything**. This file is the source of truth — keep it accurate for your environment, not mine.
+
 ---
 
 ## 0. Inputs you'll need
@@ -43,8 +60,9 @@ Gather these before you start. If any are wrong, fix them in this doc *before* r
 | Storage pool (VM disks) | `local-lvm` | `pvesm status` — pick a thin-pool that has free space |
 | Storage pool (ISOs/images) | `local` | `pvesm status` — usually `local` for content `iso,vztmpl` |
 | Network bridge | `vmbr0` | `ip -br link \| grep vmbr` |
-| LAN gateway | `10.0.0.1` | your router |
-| LAN DNS | `10.0.0.1, 1.1.1.1` | router or upstream |
+| LAN gateway | `10.0.0.2` | see "Find your LAN gateway and DNS" above |
+| LAN DNS (primary) | `10.0.0.105` | see "Find your LAN gateway and DNS" above |
+| LAN DNS (fallback) | `1.1.1.1` | leave as-is unless you forbid public DNS |
 | Template VMID | `9000` | any unused id; `9000+` is a Proxmox convention for templates |
 | VM VMID | `200` | any unused id |
 | VM name | `pss-supabase-host` | matches the repo name |
@@ -140,8 +158,8 @@ STORAGE=local-lvm
 DISK_GB=50          # final disk size; cloud image starts ~2 GB and we resize up
 RAM_MB=8192
 CORES=4
-GATEWAY=10.0.0.1
-DNS="10.0.0.1 1.1.1.1"
+GATEWAY=10.0.0.2
+DNS="10.0.0.105 1.1.1.1"
 IPADDR=10.0.0.85/24
 PUBKEY_FILE=/tmp/dev_pubkey
 
@@ -213,7 +231,7 @@ If you'd rather click through the Proxmox web UI for the first VM and only switc
    qm set 200 --agent enabled=1
    qm resize 200 scsi0 50G
    ```
-4. Back in the GUI on VMID 200 → **Cloud-Init**: set User `ubuntu`, paste your SSH public key, IP Config (net0) `Static, 10.0.0.85/24, Gateway 10.0.0.1`, DNS `10.0.0.1 1.1.1.1`. Click **Regenerate Image**.
+4. Back in the GUI on VMID 200 → **Cloud-Init**: set User `ubuntu`, paste your SSH public key, IP Config (net0) `Static, 10.0.0.85/24, Gateway 10.0.0.2`, DNS `10.0.0.105 1.1.1.1` (or your LAN's actual values — see Prerequisites). Click **Regenerate Image**.
 5. **Start** the VM.
 
 Then run the smoke test from A.3.
@@ -246,6 +264,39 @@ When all six are ✓, close the bead: `bd close pssh-81b`.
 **Need to start over from a clean slate** — `qm stop 200; qm destroy 200` then re-run section A.2. The template (9000) doesn't need rebuilding.
 
 **`400 not enough arguments` from `qm create`** — you pasted a fragment of the heredoc instead of the whole block, so a shell variable expanded to nothing. Recovery: `qm status 9000 2>/dev/null && qm destroy 9000` to clear any half-created VM, then re-paste the full A.1 fenced block in one go.
+
+**Need to change the VM's gateway / DNS after first boot** — `qm set 200 --ipconfig0 ...` updates the cloud-init metadata on the Proxmox host, but the cloud-init drive presented to the VM does **not** automatically refresh; subsequent reboots still see stale data, and `cloud-init clean --logs && reboot` re-applies from the same stale drive. Don't fight it — bypass cloud-init's network management on the VM and own the netplan file directly:
+
+```bash
+ssh ubuntu@10.0.0.85 bash <<'VM'
+set -euo pipefail
+
+# Tell cloud-init to stop managing network on this VM
+sudo tee /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg > /dev/null <<'CCFG'
+network: {config: disabled}
+CCFG
+
+# Replace cloud-init's netplan with our own static config
+sudo rm -f /etc/netplan/50-cloud-init.yaml
+sudo tee /etc/netplan/01-static.yaml > /dev/null <<'NETPLAN'
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses: [10.0.0.85/24]
+      routes:
+        - to: default
+          via: 10.0.0.2
+      nameservers:
+        addresses: [10.0.0.105, 1.1.1.1]
+        search: [powersystems.local]
+NETPLAN
+sudo chmod 600 /etc/netplan/01-static.yaml
+sudo netplan apply
+VM
+```
+
+Adjust `addresses`, `via`, `nameservers`, and `search` to match your LAN. After this, the VM's network is governed solely by `01-static.yaml` and survives any future cloud-init churn. Note: this is the recovery path; for the *first* deployment, getting the values right in the section A.2 `qm set --ipconfig0` flags is sufficient.
 
 ---
 
