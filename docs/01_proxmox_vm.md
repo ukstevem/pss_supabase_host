@@ -7,6 +7,31 @@ There are two ways: **(A) Proxmox CLI via `qm` over SSH** (preferred — every s
 
 ---
 
+## Prerequisites
+
+**Where you run things.** Every command in this doc runs from your **dev workstation** — i.e. your local terminal (Windows + Git Bash, macOS Terminal, or any Linux shell). Heredocs of the form `ssh root@10.0.0.84 bash <<'PROX' … PROX` open an SSH connection to Proxmox, execute the script remotely, and drop you back to your local prompt automatically. You should **never** need to be at an interactive `root@pve:~#` prompt while following this doc.
+
+**Passwordless SSH to Proxmox.** All the heredocs assume `ssh root@10.0.0.84 'echo OK'` works without prompting for a password. Bootstrap that once, before section 0:
+
+```bash
+# 1. Make an SSH keypair (skip if 'ls ~/.ssh/*.pub' already lists one)
+ssh-keygen -t ed25519 -C "$(whoami)@$(hostname)"
+# Press Enter through the prompts: default path, no passphrase (or set one if you prefer)
+
+# 2. Authorise that key on Proxmox — last time you'll type the root password
+ssh-copy-id root@10.0.0.84
+
+# 3. Confirm key auth works
+ssh root@10.0.0.84 'echo OK'
+# Expect: OK    (no password prompt)
+```
+
+If step 3 still asks for a password, step 2 didn't take — re-run it, watch the output for "Number of key(s) added", and try again.
+
+The same key gets baked into the new Supabase-host VM in section A.2, so once you've done this you can `ssh ubuntu@10.0.0.85` later with no extra setup.
+
+---
+
 ## 0. Inputs you'll need
 
 Gather these before you start. If any are wrong, fix them in this doc *before* running commands so the file stays the source of truth.
