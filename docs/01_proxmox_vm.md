@@ -34,9 +34,15 @@ If any of these change, update the table here **first**, then re-run only the af
 
 Run everything in this section from your dev workstation, SSHing into Proxmox.
 
+> ### ⚠️ How to paste these blocks
+>
+> Every fenced `bash` block below is **one paste**. Select from the opening ```` ```bash ```` line to the closing ```` ``` ```` and paste it whole into your terminal. Do **not** select the inner `qm ...` lines on their own — they reference shell variables (like `${TEMPLATE_VMID}`) that are defined earlier in the same block. If you paste a fragment, those variables expand to nothing and you'll see `400 not enough arguments` from `qm`.
+>
+> If you'd rather work interactively (one command at a time), substitute the literal value in for each variable as you go (e.g. `9000` instead of `${TEMPLATE_VMID}`).
+
 ### A.1 — One-time: build the Ubuntu 24.04 cloud-init template
 
-This produces a reusable Proxmox template (`VMID 9000`) that any future VM clones from. **You only do this once per Proxmox host.** Skip to A.2 if the template already exists (`qm list \| grep 9000`).
+This produces a reusable Proxmox template (`VMID 9000`) that any future VM clones from. **You only do this once per Proxmox host.** Skip to A.2 if the template already exists (`qm list | grep 9000`).
 
 ```bash
 ssh root@10.0.0.84 bash <<'PROX'
@@ -52,14 +58,16 @@ IMG_URL=https://cloud-images.ubuntu.com/noble/current/${IMG_NAME}
 mkdir -p "${IMG_DIR}"
 [ -f "${IMG_DIR}/${IMG_NAME}" ] || wget -O "${IMG_DIR}/${IMG_NAME}" "${IMG_URL}"
 
-# 2. Create a stub VM that will become the template
-qm create ${TEMPLATE_VMID} \
-  --name ubuntu-24.04-cloudinit \
-  --memory 2048 --cores 2 --cpu host \
-  --net0 virtio,bridge=vmbr0 \
-  --scsihw virtio-scsi-pci \
-  --serial0 socket --vga serial0 \
-  --agent enabled=1
+# 2. Create a stub VM, then configure it via independent qm-set calls.
+#    Splitting across multiple qm commands (instead of one long backslash-
+#    continued qm create) means a partial paste still gets a clear error
+#    rather than silently misbehaving.
+qm create ${TEMPLATE_VMID} --name ubuntu-24.04-cloudinit
+qm set ${TEMPLATE_VMID} --memory 2048 --cores 2 --cpu host
+qm set ${TEMPLATE_VMID} --net0 virtio,bridge=vmbr0
+qm set ${TEMPLATE_VMID} --scsihw virtio-scsi-pci
+qm set ${TEMPLATE_VMID} --serial0 socket --vga serial0
+qm set ${TEMPLATE_VMID} --agent enabled=1
 
 # 3. Import the cloud image as the boot disk on STORAGE
 qm importdisk ${TEMPLATE_VMID} "${IMG_DIR}/${IMG_NAME}" ${STORAGE}
@@ -211,6 +219,8 @@ When all six are ✓, close the bead: `bd close pssh-81b`.
 **VM won't boot, "no bootable device"** — `qm set 200 --boot order=scsi0` was missed. Re-set, restart.
 
 **Need to start over from a clean slate** — `qm stop 200; qm destroy 200` then re-run section A.2. The template (9000) doesn't need rebuilding.
+
+**`400 not enough arguments` from `qm create`** — you pasted a fragment of the heredoc instead of the whole block, so a shell variable expanded to nothing. Recovery: `qm status 9000 2>/dev/null && qm destroy 9000` to clear any half-created VM, then re-paste the full A.1 fenced block in one go.
 
 ---
 
