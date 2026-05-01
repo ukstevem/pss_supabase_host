@@ -73,25 +73,14 @@ There's a `.bat` wrapper at `scripts/resync.bat` that finds Git Bash and runs `r
 
 1. A console window opens.
 2. The `.bat` `cd`s to the repo root and locates `bash.exe` (tries the common Git for Windows install paths).
-3. It runs `scripts/resync.sh`, which goes through the same pre-flight → confirm → dump → restore → verify flow as if you'd run it from Git Bash.
-4. You'll get the same `Continue? (yes/no)` prompt — **type `yes` and Enter** in the console window.
-5. After the script finishes (success or failure), the window pauses with `Press any key to continue . . .` so you can read the output.
+3. **A clear warning is printed**, listing what will be destroyed and preserved (same content as the "What gets DESTROYED" section above).
+4. **You're prompted: `Type YES (uppercase) to continue, anything else to abort:`**. The uppercase requirement is deliberate — typing lowercase `yes` aborts. This is a guard against muscle-memory confirmation.
+5. If you confirmed YES, the `.bat` runs `scripts/resync.sh --yes-i-am-sure` (the bash script's own prompt is suppressed since you've already confirmed at the Windows layer). The script goes through pre-flight → dump → restore → verify.
+6. After the script finishes, the window pauses with `Press any key to continue . . .` so you can read the output before it closes.
 
 **SSH key auth note**: the `.bat` invokes Git Bash, which uses Git's SSH (which reads `~/.ssh/id_*`). If your private key has a passphrase, you'll be prompted for it during the script's SSH calls — same as running from Git Bash directly. To skip the passphrase prompts, run `ssh-agent` ahead of time and `ssh-add` your key. (Or use a key without a passphrase, for a dev box.)
 
-**To skip the confirmation prompt** (e.g. for a "just refresh now" shortcut), edit `scripts/resync.bat` and replace this line:
-
-```bat
-"%GIT_BASH%" -c "./scripts/resync.sh"
-```
-
-with:
-
-```bat
-"%GIT_BASH%" -c "./scripts/resync.sh --yes-i-am-sure"
-```
-
-Save as a different filename (e.g. `resync-no-prompt.bat`) if you want both options available.
+**Why two layers of confirmation?** The `.bat` prompts (uppercase YES) at the Windows console layer, *and* the bash `--yes-i-am-sure` flag suppresses the bash-level prompt. They're not redundant — the warning text in the `.bat` is unmissable when launched from a desktop shortcut, while the bash script's own prompt is the path for users who run from Git Bash directly. If you want the bash-level prompt back too, edit `resync.bat` to drop the `--yes-i-am-sure` flag.
 
 ---
 
@@ -104,10 +93,14 @@ Save as a different filename (e.g. `resync-no-prompt.bat`) if you want both opti
 
 ## What gets DESTROYED on the self-hosted side
 
-- The entire `public` schema (tables, rows, functions, triggers, indexes, RLS policies). Recreated from cloud.
-- Existing rows in `auth.users` / `auth.identities` / `auth.sessions` / `auth.refresh_tokens` — replaced with cloud's current rows.
+The script does `DROP SCHEMA public CASCADE` then recreates `public` from cloud's dump. Specifically destroyed:
 
-**Yes, this includes any rows you added on self-hosted yourself** — test data, exploratory inserts, dev users you created via Studio, etc. The re-sync is a clean wipe-and-reload. The script's `Continue? (yes/no)` prompt is your last chance to back out.
+- **All tables in `public`** — both ones that exist on cloud (which get recreated empty then refilled with cloud data) AND **any new tables you added on self-hosted that don't exist on cloud** (those are simply gone — the cloud dump doesn't contain them, so nothing recreates them).
+- **All rows in `public.*` tables** — including rows you added yourself.
+- **All functions, triggers, indexes, RLS policies in `public`** — anything that was in `public.*`.
+- **All rows in `auth.users` / `auth.identities` / `auth.sessions` / `auth.refresh_tokens`** — including any test users you created on self-hosted via Studio.
+
+The re-sync is a clean wipe-and-reload. Both the `.bat` confirmation (Windows) and the bash `Continue? (yes/no)` prompt are your chance to back out.
 
 ### How to keep dev work across a re-sync
 

@@ -30,11 +30,43 @@ if not defined GIT_BASH (
   exit /b 1
 )
 
+echo.
+echo ============================================================
+echo   REFRESH SELF-HOSTED SUPABASE FROM CLOUD
+echo ============================================================
+echo.
+echo   This will WIPE the dev database and reload from cloud.
+echo.
+echo   YOU WILL LOSE on self-hosted:
+echo     - Any rows you've added to public.* tables
+echo     - Any new tables you've added to the public schema
+echo     - All auth.users / sessions / identities currently there
+echo.
+echo   YOU WILL KEEP:
+echo     - Anything in custom schemas (e.g. dev_scratch.*)
+echo     - VM-level config, Docker, secrets
+echo     - The supabase stack itself
+echo.
+echo   Direction: cloud (read-only) -^> self-hosted (overwritten).
+echo   Cloud is NEVER written to.
+echo.
+echo ============================================================
+echo.
+set /p CONFIRM=Type YES (uppercase) to continue, anything else to abort:
+if /i not "%CONFIRM%"=="YES" (
+  echo.
+  echo Aborted. No changes made.
+  echo.
+  pause
+  exit /b 0
+)
+
+echo.
 echo Using bash: %GIT_BASH%
 echo Repo root:  %CD%
 echo.
 
-"%GIT_BASH%" -c "./scripts/resync.sh"
+"%GIT_BASH%" -c "./scripts/resync.sh --yes-i-am-sure"
 set "RC=%ERRORLEVEL%"
 
 echo.
