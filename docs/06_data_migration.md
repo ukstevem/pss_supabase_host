@@ -41,11 +41,12 @@ Open the cloud project in https://supabase.com/dashboard, then go to **Project S
 
 | You need | Where it is |
 |---|---|
-| **Project ref** | Top of the Database page, labelled "Reference ID" (e.g. `xyzabcdefghij`). It's the same ID that's in the project URL `https://xyzabcdefghij.supabase.co`. |
 | **Database password** | "Database password" section. If you don't know it, click **Reset database password** — it'll generate a fresh one. *Save it somewhere; you can't read it again.* |
-| **Direct connection host** | "Connection string" → "URI" tab → switch to **"Direct connection"** (NOT "Transaction pooler" or "Session pooler"). The host will be `db.<project-ref>.supabase.co`. We need direct because pg_dump uses statements pooler doesn't reliably handle. |
+| **Session pooler URI** | "Connection string" section → **URI** tab → switch to **"Session pooler"**. Copy the full URI; it'll have `[YOUR-PASSWORD]` as a placeholder where the real password goes. |
 
-> **Don't paste the password in this chat.** Put it in `.env.cloud` (gitignored, see step 0 below) and the migration heredocs will source it. The value is forwarded over SSH (encrypted) to the VM, never written to the VM's disk.
+> **Why Session pooler, not Direct connection?** Supabase's "Direct connection" host (`db.<ref>.supabase.co`) resolves to **IPv6 only**. Most home/Proxmox LANs don't have IPv6 routing, so `pg_dump` against the direct host fails with "connection refused" even though DNS works. The Session pooler is IPv4-reachable, supports the session-level state `pg_dump` requires, and is exactly what Supabase recommends for migrations. (We can't use the Transaction pooler at port 6543 — that one breaks `pg_dump` because it doesn't preserve session state across statements.)
+
+> **Don't paste the password in this chat.** Put the URI (with the real password substituted in for `[YOUR-PASSWORD]`) in `.env.cloud` (gitignored, see step 0 below) and the migration heredocs will source it. The value is forwarded over SSH (encrypted) to the VM, never written to the VM's disk.
 
 ---
 
@@ -58,28 +59,26 @@ Copy the committed template to `.env.cloud` (gitignored) and fill in your values
 cp .env.cloud.example .env.cloud
 chmod 600 .env.cloud
 # Edit .env.cloud in your editor of choice and fill in:
-#   CLOUD_PROJECT_REF, CLOUD_DB_PASSWORD, EXTRA_SCHEMAS (optional), TABLES (optional)
+#   CLOUD_DB_URL, EXTRA_SCHEMAS (optional), TABLES (optional)
 ```
 
 The shape of `.env.cloud`:
 
 ```bash
-CLOUD_PROJECT_REF=xyzabcdefghij
-CLOUD_DB_PASSWORD='your-very-long-password-from-the-dashboard'
-EXTRA_SCHEMAS=""                           # e.g. "reporting analytics" if you have non-public schemas
+# Full Session pooler URI from the dashboard, with [YOUR-PASSWORD] replaced by your actual password.
+# Example shape (yours will differ in region and ref):
+CLOUD_DB_URL='postgresql://postgres.xyzabcdefghij:your-real-pw@aws-0-eu-west-2.pooler.supabase.com:5432/postgres'
+
+EXTRA_SCHEMAS=""                                    # e.g. "reporting analytics" if you have non-public schemas
 TABLES="public.profiles public.orders auth.users"   # for the row-count verification step
 ```
 
-**Quote the password** with single quotes if it contains shell-special characters like `$`, `!`, `` ` ``, or `\`.
+**Quote the URI** with single quotes — the password embedded in it may contain shell-special characters like `$`, `!`, `` ` ``, or `\`.
 
 The remaining inputs are derived or fixed:
 
 | Var | Value | Source |
 |---|---|---|
-| `CLOUD_HOST` | `db.${CLOUD_PROJECT_REF}.supabase.co` | derived |
-| `CLOUD_USER` | `postgres` | dashboard default |
-| `CLOUD_DB` | `postgres` | dashboard default |
-| `CLOUD_PORT` | `5432` | direct connection |
 | Local DB | `supabase-db` container | per `pssh-fj1` |
 | Working dir on VM | `/opt/pss-supabase-host/migration` | created by step 1 |
 
@@ -111,25 +110,29 @@ VM
 set -a; source .env.cloud; set +a
 
 ssh ubuntu@10.0.0.85 \
-  "CLOUD_PROJECT_REF='${CLOUD_PROJECT_REF}' CLOUD_DB_PASSWORD='${CLOUD_DB_PASSWORD}' bash" <<'VM'
+  "CLOUD_DB_URL='${CLOUD_DB_URL}' bash" <<'VM'
 set -euo pipefail
 
-CLOUD_HOST="db.${CLOUD_PROJECT_REF}.supabase.co"
+# Extract host:port from the URI for DNS/TCP checks
+HOSTPORT=$(echo "${CLOUD_DB_URL}" | sed -E 's|^[^@]+@([^/]+)/.*$|\1|')
+HOST=${HOSTPORT%:*}
+PORT=${HOSTPORT##*:}
 
-echo "--- DNS resolution ---"
-getent hosts "${CLOUD_HOST}" || { echo "Could not resolve ${CLOUD_HOST}"; exit 1; }
+echo "--- pooler host:port ---"
+echo "  ${HOST}:${PORT}"
+
+echo "--- DNS resolution (expect IPv4 — pooler is IPv4) ---"
+getent hosts "${HOST}" || { echo "Could not resolve ${HOST}"; exit 1; }
 
 echo "--- TCP connectivity ---"
-nc -z -w 5 "${CLOUD_HOST}" 5432 && echo "  connect OK" || { echo "  connect FAILED"; exit 1; }
+nc -z -w 5 "${HOST}" "${PORT}" && echo "  connect OK" || { echo "  connect FAILED"; exit 1; }
 
 echo "--- SQL ping ---"
-PGPASSWORD="${CLOUD_DB_PASSWORD}" psql \
-  "postgresql://postgres@${CLOUD_HOST}:5432/postgres?sslmode=require" \
-  -c "SELECT version(), current_database(), current_user;"
+psql "${CLOUD_DB_URL}" -c "SELECT version(), current_database(), current_user;"
 VM
 ```
 
-You should see Postgres' version banner, `current_database = postgres`, `current_user = postgres`. If DNS, TCP, or SQL fails, fix that before going further (typically: wrong project ref in `.env.cloud`, IP firewall on the cloud project, or wrong password).
+You should see at least one IPv4 address in the DNS line (`A.B.C.D <hostname>`), `connect OK`, then Postgres' version banner with `current_database = postgres`. If DNS returns only an IPv6 address (`xxxx:xxxx:...`), you've copied the *Direct connection* URI rather than the *Session pooler* URI — go back to the dashboard and switch the toggle.
 
 ---
 
@@ -145,12 +148,10 @@ This produces three SQL files in `/opt/pss-supabase-host/migration/`:
 set -a; source .env.cloud; set +a
 
 ssh ubuntu@10.0.0.85 \
-  "CLOUD_PROJECT_REF='${CLOUD_PROJECT_REF}' CLOUD_DB_PASSWORD='${CLOUD_DB_PASSWORD}' EXTRA_SCHEMAS='${EXTRA_SCHEMAS}' bash" <<'VM'
+  "CLOUD_DB_URL='${CLOUD_DB_URL}' EXTRA_SCHEMAS='${EXTRA_SCHEMAS}' bash" <<'VM'
 set -euo pipefail
 
-CLOUD_HOST="db.${CLOUD_PROJECT_REF}.supabase.co"
 DUMP_DIR=/opt/pss-supabase-host/migration
-CONN="postgresql://postgres:${CLOUD_DB_PASSWORD}@${CLOUD_HOST}:5432/postgres?sslmode=require"
 
 # Build --schema args: always public, plus any extras the user listed
 SCHEMA_ARGS="--schema=public"
@@ -159,7 +160,7 @@ for s in ${EXTRA_SCHEMAS}; do
 done
 
 echo "==> 1/3 dump schema (DDL only)"
-pg_dump "${CONN}" \
+pg_dump "${CLOUD_DB_URL}" \
   ${SCHEMA_ARGS} \
   --schema-only \
   --no-owner --no-privileges \
@@ -167,7 +168,7 @@ pg_dump "${CONN}" \
   -f "${DUMP_DIR}/schema.sql"
 
 echo "==> 2/3 dump data (COPY format, no DDL)"
-pg_dump "${CONN}" \
+pg_dump "${CLOUD_DB_URL}" \
   ${SCHEMA_ARGS} \
   --data-only \
   --no-owner --no-privileges \
@@ -175,7 +176,7 @@ pg_dump "${CONN}" \
   -f "${DUMP_DIR}/data.sql"
 
 echo "==> 3/3 dump auth.* rows (data only — auth schema is provided by self-hosted GoTrue)"
-pg_dump "${CONN}" \
+pg_dump "${CLOUD_DB_URL}" \
   --table=auth.users \
   --table=auth.identities \
   --table=auth.sessions \
@@ -241,15 +242,14 @@ Compare row counts on the largest tables, between cloud and self-hosted. Adjust 
 set -a; source .env.cloud; set +a
 
 ssh ubuntu@10.0.0.85 \
-  "CLOUD_PROJECT_REF='${CLOUD_PROJECT_REF}' CLOUD_DB_PASSWORD='${CLOUD_DB_PASSWORD}' TABLES='${TABLES}' bash" <<'VM'
+  "CLOUD_DB_URL='${CLOUD_DB_URL}' TABLES='${TABLES}' bash" <<'VM'
 set -euo pipefail
-CLOUD_CONN="postgresql://postgres:${CLOUD_DB_PASSWORD}@db.${CLOUD_PROJECT_REF}.supabase.co:5432/postgres?sslmode=require"
 
 printf "%-30s %15s %15s %s\n" "Table" "Cloud" "Self-hosted" "Diff"
 printf "%-30s %15s %15s %s\n" "-----" "-----" "-----------" "----"
 
 for t in ${TABLES}; do
-  cloud_count=$(psql "${CLOUD_CONN}" -tAc "SELECT count(*) FROM ${t}" 2>/dev/null || echo "ERR")
+  cloud_count=$(psql "${CLOUD_DB_URL}" -tAc "SELECT count(*) FROM ${t}" 2>/dev/null || echo "ERR")
   local_count=$(docker exec -i supabase-db psql -U postgres -d postgres -tAc "SELECT count(*) FROM ${t}" 2>/dev/null || echo "ERR")
   if [ "${cloud_count}" = "${local_count}" ]; then
     diff="OK"
