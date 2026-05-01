@@ -1,9 +1,11 @@
 # 06 — Migrate schema + data from cloud Supabase (one-shot)
 
 **Bead:** `pssh-yp3`
-**Goal:** Use `pg_dump` against the cloud Supabase project to capture the **public** schema (tables + RLS policies + functions + triggers + indexes + sequences + data) and the rows from the Supabase-managed `auth` tables that public-schema FKs depend on. Restore into the self-hosted Postgres at `10.0.0.85`. Verify by row-count comparison on the largest tables. After this bead, the dev Supabase has the same dataset as the cloud Supabase, frozen at dump time.
+**Goal:** Use `pg_dump` against the cloud Supabase project to capture the **public** schema (tables + RLS policies + functions + triggers + indexes + sequences + data) and the rows from the Supabase-managed `auth` tables that public-schema FKs depend on. Restore into the self-hosted Postgres at `10.0.0.85`. Verify the self-hosted side looks right. After this bead, the dev Supabase has the same dataset as the cloud Supabase, frozen at dump time.
 
 This is a **one-shot** migration. If you want it kept live on an ongoing basis, that's `pssh-3ve` (logical replication) — a follow-up after we've proven app integration in `pssh-y3s`.
+
+> **Why two machines, not one:** Supabase's free Direct connection is **IPv6 only**, and the IPv4-reachable Session pooler is now behind a paid IPv4 add-on. Most home/SMB LANs don't have working IPv6 routing (this one's SonicWall doesn't advertise IPv6 prefixes), so the VM at `10.0.0.85` cannot reach the cloud DB at all. The pragmatic workflow: produce the dump on whatever machine *does* have a route to the cloud (your phone tether is usually the easiest — UK mobile networks are IPv6-native), then `scp` the resulting `.sql` files to the VM and restore there. Sections 1 and 4 run on the VM; section 2 runs wherever you have cloud connectivity; section 3 ferries the files between them.
 
 ---
 
@@ -103,57 +105,36 @@ VM
 
 ---
 
-## 2. Test connectivity to the cloud DB
+## 2. Generate the dump files (anywhere with cloud connectivity)
+
+> **Why this isn't run from the VM**: Supabase's Direct connection (`db.<ref>.supabase.co`) is **IPv6 only**. The Session/Transaction poolers (which are IPv4) are now behind Supabase's paid IPv4 add-on. On a typical home/SMB LAN without IPv6 routing — including this one, behind a SonicWall that doesn't advertise IPv6 prefixes — the VM has no path to the cloud DB at all. So we produce the dump on a machine that *does* have a working route to the cloud, then transfer the resulting SQL files to the VM in section 3.
+
+### Pick where you'll run pg_dump
+
+Any one of these works. Pick the least-friction option for your situation.
+
+| Option | Effort | Notes |
+|---|---|---|
+| **Phone tether (mobile data)** | 2 min | Most UK mobile networks are IPv6-native on 4G/5G. Tether your dev workstation's internet through your phone, then `pg_dump` works against the IPv6 Direct connection. Drop the tether when done. |
+| **Any other Linux/macOS machine that already has IPv6** | 0–5 min | A home server, a colleague's machine, an existing cloud server with IPv6. |
+| **Temporary cheap cloud VM** | 10 min, ~$0.01 | DigitalOcean / Linode / Hetzner all default to dual-stack IPv4+IPv6 and bill by the hour. Spin one up, run the dump, scp results down, destroy. |
+| **Hurricane Electric tunnel broker on this VM** | 20 min, free | tunnelbroker.net gives you a routable IPv6 /64 over IPv4. Requires the SonicWall to allow IP protocol 41 outbound. Pure config; no money. |
+| **Pay Supabase for the IPv4 add-on** | instant, ~$4/mo | Then the Session pooler URL we set up earlier works directly from this VM. No further config. |
+
+### Run pg_dump
+
+Once you're on a machine that has a working route to the cloud Supabase, **install postgresql-client-16 if it isn't there**, then load `.env.cloud` (or set `CLOUD_DB_URL` directly) and run:
 
 ```bash
-# Load the cloud creds (sourced from the gitignored .env.cloud)
+# This block is run on whichever machine you chose above — NOT necessarily the VM.
+# .env.cloud lives in the repo; if you're not on your dev workstation, copy/recreate it
+# wherever you are. The CLOUD_DB_URL should be the IPv6 Direct connection URI:
+#   postgresql://postgres:<password>@db.<project-ref>.supabase.co:5432/postgres?sslmode=require
+
 set -a; source .env.cloud; set +a
+mkdir -p ./migration && chmod 700 ./migration
 
-ssh ubuntu@10.0.0.85 \
-  "CLOUD_DB_URL='${CLOUD_DB_URL}' bash" <<'VM'
-set -euo pipefail
-
-# Extract host:port from the URI for DNS/TCP checks
-HOSTPORT=$(echo "${CLOUD_DB_URL}" | sed -E 's|^[^@]+@([^/]+)/.*$|\1|')
-HOST=${HOSTPORT%:*}
-PORT=${HOSTPORT##*:}
-
-echo "--- pooler host:port ---"
-echo "  ${HOST}:${PORT}"
-
-echo "--- DNS resolution (expect IPv4 — pooler is IPv4) ---"
-getent hosts "${HOST}" || { echo "Could not resolve ${HOST}"; exit 1; }
-
-echo "--- TCP connectivity ---"
-nc -z -w 5 "${HOST}" "${PORT}" && echo "  connect OK" || { echo "  connect FAILED"; exit 1; }
-
-echo "--- SQL ping ---"
-psql "${CLOUD_DB_URL}" -c "SELECT version(), current_database(), current_user;"
-VM
-```
-
-You should see at least one IPv4 address in the DNS line (`A.B.C.D <hostname>`), `connect OK`, then Postgres' version banner with `current_database = postgres`. If DNS returns only an IPv6 address (`xxxx:xxxx:...`), you've copied the *Direct connection* URI rather than the *Session pooler* URI — go back to the dashboard and switch the toggle.
-
----
-
-## 3. Dump from cloud
-
-This produces three SQL files in `/opt/pss-supabase-host/migration/`:
-
-- `schema.sql` — `public` schema DDL
-- `data.sql` — `public` schema data (COPY format)
-- `auth.sql` — rows from `auth.users` / `auth.identities` / `auth.sessions` / `auth.refresh_tokens`
-
-```bash
-set -a; source .env.cloud; set +a
-
-ssh ubuntu@10.0.0.85 \
-  "CLOUD_DB_URL='${CLOUD_DB_URL}' EXTRA_SCHEMAS='${EXTRA_SCHEMAS}' bash" <<'VM'
-set -euo pipefail
-
-DUMP_DIR=/opt/pss-supabase-host/migration
-
-# Build --schema args: always public, plus any extras the user listed
+# Build --schema args: always public, plus any extras
 SCHEMA_ARGS="--schema=public"
 for s in ${EXTRA_SCHEMAS}; do
   SCHEMA_ARGS="${SCHEMA_ARGS} --schema=${s}"
@@ -165,7 +146,7 @@ pg_dump "${CLOUD_DB_URL}" \
   --schema-only \
   --no-owner --no-privileges \
   --no-publications --no-subscriptions \
-  -f "${DUMP_DIR}/schema.sql"
+  -f ./migration/schema.sql
 
 echo "==> 2/3 dump data (COPY format, no DDL)"
 pg_dump "${CLOUD_DB_URL}" \
@@ -173,7 +154,7 @@ pg_dump "${CLOUD_DB_URL}" \
   --data-only \
   --no-owner --no-privileges \
   --disable-triggers \
-  -f "${DUMP_DIR}/data.sql"
+  -f ./migration/data.sql
 
 echo "==> 3/3 dump auth.* rows (data only — auth schema is provided by self-hosted GoTrue)"
 pg_dump "${CLOUD_DB_URL}" \
@@ -184,15 +165,31 @@ pg_dump "${CLOUD_DB_URL}" \
   --data-only \
   --no-owner --no-privileges \
   --disable-triggers \
-  -f "${DUMP_DIR}/auth.sql"
+  -f ./migration/auth.sql
 
-ls -la "${DUMP_DIR}/"
-echo "--- sizes ---"
-wc -l "${DUMP_DIR}"/*.sql
-VM
+ls -la ./migration/
+wc -l ./migration/*.sql
 ```
 
-The `--no-owner --no-privileges` flags strip cloud-specific role names from the dump (cloud uses roles like `postgres`, `supabase_admin`, etc.). On restore, everything ends up owned by the local `postgres` user. The `--disable-triggers` flag wraps data inserts in `SET session_replication_role = replica` so FK constraints don't fail the load.
+The `--no-owner --no-privileges` flags strip cloud-specific role names from the dump (cloud uses roles like `supabase_admin`, etc.). On restore, everything ends up owned by the local `postgres` user. The `--disable-triggers` flag wraps data inserts in `SET session_replication_role = replica` so FK constraints don't fail the load.
+
+End state of this section: three SQL files (`schema.sql`, `data.sql`, `auth.sql`) on the machine where you ran the dump.
+
+---
+
+## 3. Transfer the dump files to the VM
+
+From wherever the SQL files ended up:
+
+```bash
+# If you ran the dump from your dev workstation, the files are in ./migration/ — adjust if elsewhere.
+scp -r ./migration/*.sql ubuntu@10.0.0.85:/opt/pss-supabase-host/migration/
+
+# Quick sanity check on the receiving end
+ssh ubuntu@10.0.0.85 'ls -la /opt/pss-supabase-host/migration/ && wc -l /opt/pss-supabase-host/migration/*.sql'
+```
+
+The directory was created as part of section 1; permissions should already be correct (`700`, owned by `ubuntu`).
 
 ---
 
@@ -236,53 +233,65 @@ Common errors and how to read them:
 
 ## 5. Verify
 
-Compare row counts on the largest tables, between cloud and self-hosted. Adjust the `TABLES` list to whatever's representative for your project — it's used both ways.
+Two parts: (a) confirm self-hosted is in a sensible state on its own; (b) optionally compare against cloud if you still have a way to reach the cloud DB.
+
+### 5a. Self-hosted sanity check
+
+This is the part you should always run.
 
 ```bash
-set -a; source .env.cloud; set +a
-
 ssh ubuntu@10.0.0.85 \
-  "CLOUD_DB_URL='${CLOUD_DB_URL}' TABLES='${TABLES}' bash" <<'VM'
+  "TABLES='${TABLES:-public.profiles public.orders auth.users}' bash" <<'VM'
 set -euo pipefail
 
-printf "%-30s %15s %15s %s\n" "Table" "Cloud" "Self-hosted" "Diff"
-printf "%-30s %15s %15s %s\n" "-----" "-----" "-----------" "----"
+printf "%-30s %15s\n" "Table" "Self-hosted rows"
+printf "%-30s %15s\n" "-----" "----------------"
 
 for t in ${TABLES}; do
-  cloud_count=$(psql "${CLOUD_DB_URL}" -tAc "SELECT count(*) FROM ${t}" 2>/dev/null || echo "ERR")
   local_count=$(docker exec -i supabase-db psql -U postgres -d postgres -tAc "SELECT count(*) FROM ${t}" 2>/dev/null || echo "ERR")
-  if [ "${cloud_count}" = "${local_count}" ]; then
-    diff="OK"
-  else
-    diff=$(( cloud_count - local_count ))
-  fi
-  printf "%-30s %15s %15s %s\n" "${t}" "${cloud_count}" "${local_count}" "${diff}"
+  printf "%-30s %15s\n" "${t}" "${local_count}"
 done
 VM
 ```
 
-Expected: `OK` for every row. Any non-zero diff means data drift (rows added on cloud after dump, or restore failure on a specific table). Drift is fine if you know about it; `ERR` on either side means the table doesn't exist there.
+Expected: non-zero counts on tables you know have data; no `ERR`s.
 
-Sample query: pick one app entity and confirm it round-trips. From self-hosted Studio's SQL editor:
+Sample query — pick one app entity and confirm it looks right. From self-hosted Studio's SQL editor:
 
 ```sql
 SELECT id, created_at FROM public.profiles ORDER BY created_at DESC LIMIT 5;
 ```
 
-Compare against the same query in cloud Studio.
+### 5b. Optional: compare against cloud row counts
+
+Only meaningful if you can still reach the cloud DB (i.e. you're back on the same machine you used in step 2, with `CLOUD_DB_URL` set). Run this from there — *not* the VM:
+
+```bash
+set -a; source .env.cloud; set +a
+
+printf "%-30s %15s\n" "Table" "Cloud rows"
+printf "%-30s %15s\n" "-----" "----------"
+
+for t in ${TABLES}; do
+  cloud_count=$(psql "${CLOUD_DB_URL}" -tAc "SELECT count(*) FROM ${t}" 2>/dev/null || echo "ERR")
+  printf "%-30s %15s\n" "${t}" "${cloud_count}"
+done
+```
+
+Eyeball the two tables side-by-side. Any divergence is either drift (rows added/changed on cloud after the dump time) or a restore failure on a specific table.
 
 ---
 
 ## Acceptance checklist (for `pssh-yp3`)
 
-- [ ] `pg_dump` ran cleanly against cloud — `schema.sql`, `data.sql`, `auth.sql` exist in `/opt/pss-supabase-host/migration/`, all non-empty
-- [ ] Restore in step 4 completed without `ERROR` lines (other than benign warnings about plpgsql etc.)
-- [ ] Row-count comparison in step 5: every table in `TABLES` reports `OK`
+- [ ] `schema.sql`, `data.sql`, `auth.sql` produced (section 2) and present in `/opt/pss-supabase-host/migration/` on the VM after the scp (section 3), all non-empty
+- [ ] Restore in section 4 completed without `ERROR` lines (other than benign warnings about plpgsql etc.)
+- [ ] Self-hosted row-count check (section 5a): non-zero counts on tables you know have data, no `ERR`s
 - [ ] Sample SQL query against self-hosted Studio returns the expected data
-- [ ] An existing cloud-side user can sign in via the self-hosted Studio's SQL Editor (run `SELECT id, email FROM auth.users LIMIT 5;` — emails should match cloud)
-- [ ] No app-rebuild required yet (we haven't pointed apps at the new instance — that's `pssh-y3s`)
+- [ ] `auth.users` populated — `SELECT email FROM auth.users LIMIT 5;` from self-hosted Studio's SQL Editor returns real cloud emails
+- [ ] (Optional) cloud-vs-self-hosted row counts (section 5b) match within drift tolerance
 
-When all six are ✓, close the bead: `bd close pssh-yp3`.
+When the first five are ✓ (the optional sixth is bonus), close the bead: `bd close pssh-yp3`.
 
 ---
 
