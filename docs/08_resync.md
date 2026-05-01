@@ -58,6 +58,43 @@ This fully automates the dev refresh. The script's pre-flight checks abort clean
 
 ---
 
+## Windows desktop shortcut
+
+There's a `.bat` wrapper at `scripts/resync.bat` that finds Git Bash and runs `resync.sh` under it. Use it to launch the re-sync from a Windows desktop shortcut without opening Git Bash manually.
+
+**Set up the shortcut:**
+
+1. Right-click the desktop → **New → Shortcut**.
+2. Browse to `C:\Dev\PSS\pss-supabase-host\scripts\resync.bat`. Click **Next**.
+3. Name it something like `Refresh dev Supabase`. Click **Finish**.
+4. (Optional) Right-click the new shortcut → **Properties** → change the icon if you want.
+
+**What happens when you double-click it:**
+
+1. A console window opens.
+2. The `.bat` `cd`s to the repo root and locates `bash.exe` (tries the common Git for Windows install paths).
+3. It runs `scripts/resync.sh`, which goes through the same pre-flight → confirm → dump → restore → verify flow as if you'd run it from Git Bash.
+4. You'll get the same `Continue? (yes/no)` prompt — **type `yes` and Enter** in the console window.
+5. After the script finishes (success or failure), the window pauses with `Press any key to continue . . .` so you can read the output.
+
+**SSH key auth note**: the `.bat` invokes Git Bash, which uses Git's SSH (which reads `~/.ssh/id_*`). If your private key has a passphrase, you'll be prompted for it during the script's SSH calls — same as running from Git Bash directly. To skip the passphrase prompts, run `ssh-agent` ahead of time and `ssh-add` your key. (Or use a key without a passphrase, for a dev box.)
+
+**To skip the confirmation prompt** (e.g. for a "just refresh now" shortcut), edit `scripts/resync.bat` and replace this line:
+
+```bat
+"%GIT_BASH%" -c "./scripts/resync.sh"
+```
+
+with:
+
+```bat
+"%GIT_BASH%" -c "./scripts/resync.sh --yes-i-am-sure"
+```
+
+Save as a different filename (e.g. `resync-no-prompt.bat`) if you want both options available.
+
+---
+
 ## What gets preserved across a re-sync
 
 - **VM-level config** — Docker, UFW, hardening, secrets at `/opt/pss-supabase-host/.env`. Untouched.
@@ -70,7 +107,33 @@ This fully automates the dev refresh. The script's pre-flight checks abort clean
 - The entire `public` schema (tables, rows, functions, triggers, indexes, RLS policies). Recreated from cloud.
 - Existing rows in `auth.users` / `auth.identities` / `auth.sessions` / `auth.refresh_tokens` — replaced with cloud's current rows.
 
-If you've been doing dev work in self-hosted and have something you want to keep — *export it before running re-sync*. The script's confirmation prompt is your last chance.
+**Yes, this includes any rows you added on self-hosted yourself** — test data, exploratory inserts, dev users you created via Studio, etc. The re-sync is a clean wipe-and-reload. The script's `Continue? (yes/no)` prompt is your last chance to back out.
+
+### How to keep dev work across a re-sync
+
+If you're doing meaningful work on self-hosted and want it to survive re-syncs, two patterns work:
+
+1. **Use a separate schema for experimental data.** The script only drops `public`, so anything in another schema is untouched:
+   ```sql
+   -- Run once in self-hosted Studio's SQL Editor
+   CREATE SCHEMA dev_scratch;
+   -- Then put your experimental tables there:
+   CREATE TABLE dev_scratch.my_experiment (...);
+   ```
+   `dev_scratch` is preserved across every re-sync. (Same applies to a custom schema named anything *other* than `public` — `experiments`, `prototyping`, etc.)
+
+2. **Manual export before re-sync.** If your work is in `public` (e.g. you added rows to existing public tables), dump those rows before running the script:
+   ```bash
+   ssh ubuntu@10.0.0.85 'docker exec -i supabase-db pg_dump -U postgres -d postgres \
+     --data-only --table=public.<your_table> -t public.<another>' > my-dev-data.sql
+   ```
+   After re-sync, restore selectively:
+   ```bash
+   cat my-dev-data.sql | ssh ubuntu@10.0.0.85 'docker exec -i supabase-db psql -U supabase_admin -d postgres'
+   ```
+   This may collide with rows in cloud's data (if you used real PKs); easiest if your dev rows have non-overlapping IDs (e.g. UUIDs, or numeric IDs in a high range).
+
+For one-off experiments, pattern 2 is simpler. For ongoing dev work that you want to maintain across many re-syncs, pattern 1 is cleaner.
 
 ---
 
