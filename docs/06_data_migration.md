@@ -45,22 +45,42 @@ Open the cloud project in https://supabase.com/dashboard, then go to **Project S
 | **Database password** | "Database password" section. If you don't know it, click **Reset database password** — it'll generate a fresh one. *Save it somewhere; you can't read it again.* |
 | **Direct connection host** | "Connection string" → "URI" tab → switch to **"Direct connection"** (NOT "Transaction pooler" or "Session pooler"). The host will be `db.<project-ref>.supabase.co`. We need direct because pg_dump uses statements pooler doesn't reliably handle. |
 
-> **Don't paste the password in this chat.** When the migration script asks for it, type it directly in your local terminal — the value is captured into a shell variable and only ever travels over the SSH tunnel to the VM.
+> **Don't paste the password in this chat.** Put it in `.env.cloud` (gitignored, see step 0 below) and the migration heredocs will source it. The value is forwarded over SSH (encrypted) to the VM, never written to the VM's disk.
 
 ---
 
-## 0. Inputs
+## 0. Inputs — set up `.env.cloud` once
 
-| Var | Default | Source |
+Copy the committed template to `.env.cloud` (gitignored) and fill in your values:
+
+```bash
+# From the repo root on your dev workstation
+cp .env.cloud.example .env.cloud
+chmod 600 .env.cloud
+# Edit .env.cloud in your editor of choice and fill in:
+#   CLOUD_PROJECT_REF, CLOUD_DB_PASSWORD, EXTRA_SCHEMAS (optional), TABLES (optional)
+```
+
+The shape of `.env.cloud`:
+
+```bash
+CLOUD_PROJECT_REF=xyzabcdefghij
+CLOUD_DB_PASSWORD='your-very-long-password-from-the-dashboard'
+EXTRA_SCHEMAS=""                           # e.g. "reporting analytics" if you have non-public schemas
+TABLES="public.profiles public.orders auth.users"   # for the row-count verification step
+```
+
+**Quote the password** with single quotes if it contains shell-special characters like `$`, `!`, `` ` ``, or `\`.
+
+The remaining inputs are derived or fixed:
+
+| Var | Value | Source |
 |---|---|---|
-| `CLOUD_PROJECT_REF` | (you provide) | dashboard reference ID |
-| `CLOUD_DB_PASSWORD` | (you provide) | dashboard, prompted at run-time |
 | `CLOUD_HOST` | `db.${CLOUD_PROJECT_REF}.supabase.co` | derived |
 | `CLOUD_USER` | `postgres` | dashboard default |
 | `CLOUD_DB` | `postgres` | dashboard default |
 | `CLOUD_PORT` | `5432` | direct connection |
-| `EXTRA_SCHEMAS` | `""` (empty) | space-separated list, e.g. `"reporting analytics"` if you have custom non-public schemas |
-| Local DB | `supabase-db` container | (per `pssh-fj1`) |
+| Local DB | `supabase-db` container | per `pssh-fj1` |
 | Working dir on VM | `/opt/pss-supabase-host/migration` | created by step 1 |
 
 ---
@@ -87,13 +107,8 @@ VM
 ## 2. Test connectivity to the cloud DB
 
 ```bash
-# Type the password when prompted; it goes into a local var only,
-# then transits over SSH (encrypted) to the VM.
-read -s -p "Cloud Supabase DB password: " CLOUD_DB_PASSWORD
-echo  # newline after the silent prompt
-
-# Set your project ref here (from the dashboard)
-CLOUD_PROJECT_REF=xyzabcdefghij    # <-- EDIT THIS
+# Load the cloud creds (sourced from the gitignored .env.cloud)
+set -a; source .env.cloud; set +a
 
 ssh ubuntu@10.0.0.85 \
   "CLOUD_PROJECT_REF='${CLOUD_PROJECT_REF}' CLOUD_DB_PASSWORD='${CLOUD_DB_PASSWORD}' bash" <<'VM'
@@ -114,7 +129,7 @@ PGPASSWORD="${CLOUD_DB_PASSWORD}" psql \
 VM
 ```
 
-You should see Postgres' version banner, `current_database = postgres`, `current_user = postgres`. If DNS, TCP, or SQL fails, fix that before going further (typically: wrong project ref, IP firewall on the cloud project, or wrong password).
+You should see Postgres' version banner, `current_database = postgres`, `current_user = postgres`. If DNS, TCP, or SQL fails, fix that before going further (typically: wrong project ref in `.env.cloud`, IP firewall on the cloud project, or wrong password).
 
 ---
 
@@ -127,10 +142,7 @@ This produces three SQL files in `/opt/pss-supabase-host/migration/`:
 - `auth.sql` — rows from `auth.users` / `auth.identities` / `auth.sessions` / `auth.refresh_tokens`
 
 ```bash
-read -s -p "Cloud Supabase DB password: " CLOUD_DB_PASSWORD
-echo
-CLOUD_PROJECT_REF=xyzabcdefghij    # <-- EDIT THIS
-EXTRA_SCHEMAS=""                   # <-- e.g. "reporting analytics" if you have non-public schemas
+set -a; source .env.cloud; set +a
 
 ssh ubuntu@10.0.0.85 \
   "CLOUD_PROJECT_REF='${CLOUD_PROJECT_REF}' CLOUD_DB_PASSWORD='${CLOUD_DB_PASSWORD}' EXTRA_SCHEMAS='${EXTRA_SCHEMAS}' bash" <<'VM'
@@ -226,10 +238,7 @@ Common errors and how to read them:
 Compare row counts on the largest tables, between cloud and self-hosted. Adjust the `TABLES` list to whatever's representative for your project — it's used both ways.
 
 ```bash
-read -s -p "Cloud Supabase DB password: " CLOUD_DB_PASSWORD
-echo
-CLOUD_PROJECT_REF=xyzabcdefghij    # <-- EDIT THIS
-TABLES="public.users public.profiles public.orders auth.users"   # <-- EDIT FOR YOUR SCHEMA
+set -a; source .env.cloud; set +a
 
 ssh ubuntu@10.0.0.85 \
   "CLOUD_PROJECT_REF='${CLOUD_PROJECT_REF}' CLOUD_DB_PASSWORD='${CLOUD_DB_PASSWORD}' TABLES='${TABLES}' bash" <<'VM'

@@ -4,8 +4,10 @@
 *.db
 .beads-credential-key
 
-# Local secrets — only .env.example is committed.
+# Local secrets — only *.env.example templates are committed.
 # Real .env lives on the VM at /opt/pss-supabase-host/.env (mode 600).
+# Per-machine .env.cloud (and similar) are local only.
 .env
-.env.local
-*.env.local
+.env.*
+!.env.example
+!.env.*.example
