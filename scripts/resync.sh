@@ -159,7 +159,17 @@ VM
 echo ""
 echo "==> step 2/3: restore on self-hosted"
 
-ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U postgres -d postgres -c "DROP SCHEMA public CASCADE;" 2>&1 | grep -v "^DROP SCHEMA$" || true'
+# Wipe public schema completely. Cascades drop all public tables/funcs/policies.
+echo "  drop public schema..."
+ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U postgres -d postgres -c "DROP SCHEMA public CASCADE;" 2>&1 | tail -1'
+
+# Wipe the auth.* tables we'll be reloading. Without this, auth.sql's COPY
+# hits duplicate-key conflicts on re-runs (auth.users keeps rows from the
+# previous load until something explicitly clears them). RESTART IDENTITY
+# resets sequence values; CASCADE handles any cross-schema FKs from the
+# supabase-managed schemas (storage etc.).
+echo "  truncate auth tables..."
+ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -c "TRUNCATE auth.users, auth.identities, auth.sessions, auth.refresh_tokens RESTART IDENTITY CASCADE;" 2>&1 | tail -1'
 
 echo "  schema..."
 ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/schema.sql 2>&1 | grep -E "^ERROR" | head -5 || true'
