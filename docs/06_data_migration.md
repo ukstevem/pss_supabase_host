@@ -5,7 +5,9 @@
 
 This is a **one-shot** migration. If you want it kept live on an ongoing basis, that's `pssh-3ve` (logical replication) — a follow-up after we've proven app integration in `pssh-y3s`.
 
-> **Why two machines, not one:** Supabase's free Direct connection is **IPv6 only**, and the IPv4-reachable Session pooler is now behind a paid IPv4 add-on. Most home/SMB LANs don't have working IPv6 routing (this one's SonicWall doesn't advertise IPv6 prefixes), so the VM at `10.0.0.85` cannot reach the cloud DB at all. The pragmatic workflow: produce the dump on whatever machine *does* have a route to the cloud (your phone tether is usually the easiest — UK mobile networks are IPv6-native), then `scp` the resulting `.sql` files to the VM and restore there. Sections 1 and 4 run on the VM; section 2 runs wherever you have cloud connectivity; section 3 ferries the files between them.
+> **Networking caveat — IPv4 add-on**: Supabase's free Direct connection (`db.<ref>.supabase.co`) is **IPv6 only**. The Session pooler (IPv4) and IPv4 access to the Direct connection are both behind a paid **IPv4 add-on** ($4/mo at time of writing). Most home/SMB LANs don't have working IPv6 routing (the LAN this was built on is behind a SonicWall that doesn't advertise IPv6 prefixes), so the VM at `10.0.0.85` cannot reach the cloud DB without one of two things: (a) the IPv4 add-on enabled on the cloud project, or (b) IPv6 enabled on the LAN router/firewall. Pragmatically: enable the add-on for the duration of the migration, run sections 1–4 from the VM, then cancel the add-on. Two-machine workflow (dump elsewhere, scp to VM) is documented in section 2 as a fallback.
+
+> **Cloud password ≠ API key**: Supabase has multiple "secrets" that look superficially similar. The migration needs the **Database password** (Settings → Database → "Database password"), *not* the service-role key (`sb_secret_…` or the longer `eyJhbG…` JWT, used in API headers, *not* a Postgres role's password). Easy mistake — Postgres will reject the API key with `password authentication failed`, and after a few attempts will auto-ban the source IP (see "IP banned" in Troubleshooting).
 
 ---
 
@@ -88,20 +90,33 @@ The remaining inputs are derived or fixed:
 
 ## 1. Install postgresql-client on the VM
 
-We need `pg_dump` and `psql` on the VM itself (rather than running them inside the `supabase-db` container) so the dumped SQL files land on the VM's filesystem and can be restored cleanly.
+We need `pg_dump` and `psql` on the VM. **Critical**: the client major version must be **≥** the cloud server's major version. Cloud Supabase is on PG17, so we need `postgresql-client-17`. Ubuntu 24.04's default repo only ships up to v16, so we add PostgreSQL's official apt repo:
 
 ```bash
 ssh ubuntu@10.0.0.85 bash <<'VM'
 set -euo pipefail
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-client-16
+
+echo "==> add PG official apt repo (Ubuntu 24.04 default repos top out at v16)"
+sudo install -d /usr/share/postgresql-common/pgdg
+sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+  -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+  | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+
+echo "==> install postgresql-client-17"
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-client-17
+
+echo "==> migration working dir"
 mkdir -p /opt/pss-supabase-host/migration
 chmod 700 /opt/pss-supabase-host/migration
-echo "pg_dump version:"
-pg_dump --version
+
+echo "==> verify"
+pg_dump --version  # should report 17.x; if cloud is later upgraded to 18, install -18 here
 VM
 ```
 
-`postgresql-client-16` is fine to dump from a 15 server — pg_dump is forwards-compatible. (If you're on a newer Ubuntu, `-17` works the same.)
+> **Why ≥ server version**: pg_dump is *forwards*-compatible (newer client can dump older servers) but not backwards. A v16 client trying to dump a v17 server aborts with `aborting because of server version mismatch`.
 
 ---
 
@@ -195,38 +210,35 @@ The directory was created as part of section 1; permissions should already be co
 
 ## 4. Restore into self-hosted
 
+Two important nuances vs. a vanilla pg_restore:
+
+1. **Drop the empty default `public` schema first.** Supabase's container init creates an empty `public` schema; the dump's `CREATE SCHEMA public` then conflicts. `DROP SCHEMA public CASCADE` is safe because the default is empty.
+2. **Run as `supabase_admin`, not `postgres`, for the data restores.** In `supabase/postgres:17.x`, the `postgres` role is **not** a superuser (changed from PG15). The dump's `--disable-triggers` emits `ALTER TABLE ... DISABLE TRIGGER ALL`, which requires superuser. Only `supabase_admin` is. Trust auth via the local Unix socket inside the container means no password needed for the in-container `-U supabase_admin` connection.
+
+The schema restore can run as `postgres` (it's just DDL), but the auth and data restores must use `supabase_admin`.
+
 ```bash
-ssh ubuntu@10.0.0.85 bash <<'VM'
-set -euo pipefail
-DUMP_DIR=/opt/pss-supabase-host/migration
+# Step A: drop the default empty public schema so the dump's CREATE SCHEMA works
+ssh ubuntu@10.0.0.85 'docker exec -i supabase-db psql -U postgres -d postgres -c "DROP SCHEMA public CASCADE;"'
 
-restore_into_db() {
-  local sql_file=$1
-  echo "==> restoring $(basename "${sql_file}") into supabase-db..."
-  docker exec -i supabase-db psql \
-    -U postgres -d postgres \
-    -v ON_ERROR_STOP=1 \
-    -f - < "${sql_file}" \
-    | tail -20
-}
+# Step B: restore the schema (DDL)
+ssh ubuntu@10.0.0.85 'docker exec -i supabase-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/schema.sql 2>&1 | tail -30'
 
-# Order:
-# 1. schema (creates public.* tables — auth.users already exists, provided by GoTrue)
-# 2. auth data (auth.users rows — must come BEFORE public data because of FKs)
-# 3. public data (now FKs to auth.users will resolve)
-restore_into_db "${DUMP_DIR}/schema.sql"
-restore_into_db "${DUMP_DIR}/auth.sql"
-restore_into_db "${DUMP_DIR}/data.sql"
+# Step C: restore auth.* data — must come BEFORE public data due to FKs (run as supabase_admin)
+ssh ubuntu@10.0.0.85 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/auth.sql 2>&1 | tail -20'
 
-echo "==> done"
-VM
+# Step D: restore public.* data (the slow one — minutes for tens of MB; run as supabase_admin)
+ssh ubuntu@10.0.0.85 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/data.sql 2>&1 | tail -30'
 ```
 
-`-v ON_ERROR_STOP=1` makes psql exit on the first error (otherwise it'll plow through and you only notice problems hours later). If something fails, the message will be in the last 20 lines piped via `tail`.
+`-v ON_ERROR_STOP=1` makes psql exit on the first error rather than plowing through. The dump finishes with a series of `setval` calls; seeing those in step D's tail output is the signal it completed.
 
 Common errors and how to read them:
-- `relation "<thing>" already exists` — schema.sql ran twice. Either you re-ran step 4, or there are leftover tables from a previous attempt. Drop the public schema and try again (see Rollback below).
-- `violates foreign key constraint "<...>_user_id_fkey"` — auth.users hadn't been loaded yet. Re-run with `auth.sql` before `data.sql` (already the order in the script).
+- `schema "public" already exists` — you skipped step A. Run it, then retry from step B.
+- `must be owner of table users` / `permission denied: "..." is a system trigger` — you ran step C or D as `postgres` instead of `supabase_admin`. The `postgres` role is non-superuser in PG17 supabase image so it can't disable triggers. Re-run with `-U supabase_admin`.
+- `aborting because of server version mismatch` (during dump in section 2) — your `pg_dump` client is older than the server. Install `postgresql-client-17` from PG's official apt repo (covered in section 1).
+- `relation "<thing>" already exists` — schema.sql ran twice without a DROP in between. Run step A again, then re-do steps B/C/D in order.
+- `violates foreign key constraint "<...>_user_id_fkey"` — auth.users hadn't been loaded yet. Re-run in the C-then-D order shown above.
 - `extension "<x>" is not available` — cloud DB has an extension self-hosted doesn't. `docker exec supabase-db psql -U postgres -c '\dx'` shows what's installed; install the missing one on self-hosted before retrying.
 
 ---
@@ -322,11 +334,42 @@ For a *full* reset back to "stack just came up, empty DB":
 ```bash
 ssh ubuntu@10.0.0.85 bash <<'VM'
 cd /opt/supabase/docker
-docker compose down -v   # wipes ALL volumes including the database
+docker compose down -v   # named-volume wipe; does NOT touch the bind-mounted db data
+sudo rm -rf volumes/db/data   # bind-mount survives 'down -v' — must be removed manually
 docker compose up -d
-sleep 60   # wait for db to be healthy again
+sleep 90   # wait for db to be healthy again
 VM
 ```
+
+---
+
+## Troubleshooting
+
+### `aborting because of server version mismatch` during `pg_dump`
+Your `pg_dump` is older than the cloud server. Cloud Supabase has been on PG17 since late 2024. Install `postgresql-client-17` from PG's official apt repo — section 1 covers the exact commands.
+
+### `password authentication failed for user "postgres"` against cloud
+The value in `CLOUD_DB_PASSWORD` (or your inline URL) isn't the Database password. Common causes:
+- **You used a service-role key** (`sb_secret_...` or `eyJhbG...`) instead. Those go in API request headers, not as a Postgres password. Get the actual Database password from Settings → Database → "Database password".
+- **Stray whitespace / partial paste**. `echo "Password length: ${#CLOUD_DB_PASSWORD}"` — Supabase reset passwords are usually 24+ chars; if yours is shorter you've copied a fragment.
+- **Reset hasn't propagated**. Wait 30 s after a reset before retrying.
+
+### `Connection refused` to cloud after several failed auth attempts
+**Supabase auto-bans the source IP after a few failed Postgres auth attempts** — symptom changes from `password authentication failed` to TCP refusal. Fix:
+1. Dashboard → Settings → Database → **Banned IPs** section. Find your office's NAT'd IP and unban it.
+2. Make absolutely sure the password is correct before retrying — *do not retry blindly*; each fail re-counts toward the ban.
+
+### `must be owner of table users` / `permission denied: "..." is a system trigger` during restore
+You ran step C or D as `-U postgres`. In `supabase/postgres:17.x`, the `postgres` role is **not** a superuser. Re-run with `-U supabase_admin` — it has trust auth via the local Unix socket inside the container, so no password needed.
+
+### `schema "public" already exists` during schema restore
+You skipped the DROP step. Run step A in section 4, then retry from step B.
+
+### `database files are incompatible with server` after changing PG image tag
+Supabase compose mounts the Postgres data dir as a **bind-mount** (`./volumes/db/data` on the VM filesystem), not a named docker volume. `docker compose down -v` removes named volumes but not bind-mounts. When changing major versions, manually `sudo rm -rf /opt/supabase/docker/volumes/db/data` before restarting.
+
+### Dump only resolves to IPv6 (`2a05:...` from `getent hosts`)
+You don't have the Supabase IPv4 add-on enabled, *or* your network has working IPv6. Check the dashboard for the IPv4 add-on toggle. If you don't want to pay, see section 2's table of alternative places to run the dump (phone tether is usually the easiest free option for UK mobile networks).
 
 ---
 

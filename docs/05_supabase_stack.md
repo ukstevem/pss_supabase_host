@@ -48,11 +48,14 @@ LAN-reachable ports (post-bring-up): `8000` (Kong — REST + Studio), `5432`/`65
 | Supabase repo path on VM | `/opt/supabase` | rare; coordinate with anyone else SSHing in |
 | Compose working dir | `/opt/supabase/docker` | Supabase canonical; don't change |
 | Our secrets file | `/opt/pss-supabase-host/.env` | (per `pssh-9fi`) |
+| **Postgres image tag** | `supabase/postgres:17.6.1.113` | **Pin to match the cloud project's Postgres major version**. Cloud Supabase has been on PG17 since late 2024; using PG15 here causes pg_dump output from cloud to fail to restore into self-hosted. Find latest stable 17.x tags with the docker-hub query in step 1. |
 | Studio external URL | `http://10.0.0.85:8000` | VM IP changed |
 | Kong public URL | `http://10.0.0.85:8000` | VM IP changed |
 | LAN CIDR (UFW source) | `10.0.0.0/24` | per `pssh-cgj` inputs |
 
 If any change, update this table **first**.
+
+> **Why pin the Postgres image** — Supabase's `master` branch sometimes points its compose at older Postgres tags (we cloned at a point where it was `15.8.1.085`). The data migration in `pssh-yp3` dumps from cloud (PG17), and a cross-major-version restore fails due to pg_dump emitting v17-only psql metacommands like `\restrict` that v15 doesn't recognise. Pinning self-hosted to the same major version up front avoids the whole class of issue.
 
 ---
 
@@ -69,6 +72,7 @@ COMPOSE_DIR=${SUPABASE_DIR}/docker
 PSS_DIR=/opt/pss-supabase-host
 LAN_CIDR=10.0.0.0/24
 PUBLIC_URL=http://10.0.0.85:8000
+PG_IMAGE_TAG=17.6.1.113   # see "Inputs" — pin to match cloud's PG major version
 
 echo "==> 1/6 clone supabase/supabase (shallow)"
 if [ ! -d "${SUPABASE_DIR}/.git" ]; then
@@ -109,7 +113,10 @@ sed -i "s|^SUPABASE_PUBLIC_URL=.*|SUPABASE_PUBLIC_URL=${PUBLIC_URL}|" ${COMPOSE_
 
 chmod 600 ${COMPOSE_DIR}/.env
 
-echo "==> 3/6 (no UFW changes needed — Studio reached via Kong on 8000, already allowed in pssh-cgj)"
+echo "==> 3/6 pin postgres image to ${PG_IMAGE_TAG} (matches cloud's PG major version — see 'Inputs')"
+sudo sed -i "s|supabase/postgres:[0-9][0-9.]*|supabase/postgres:${PG_IMAGE_TAG}|g" ${COMPOSE_DIR}/docker-compose.yml
+echo "Now using:"
+grep "supabase/postgres" ${COMPOSE_DIR}/docker-compose.yml | head -3
 
 echo "==> 4/6 docker compose pull (this takes a while — ~2 GB on first run)"
 cd ${COMPOSE_DIR}
