@@ -1,7 +1,9 @@
 # 05 — Bring up the Supabase self-hosted stack
 
 **Bead:** `pssh-fj1`
-**Goal:** Clone the Supabase self-hosted compose stack, merge our generated secrets into its `.env` template, configure URLs so Studio and Kong are reachable from the LAN at `http://10.0.0.85:{3000,8000}`, pull all images, `docker compose up -d`, and verify every service is healthy. After this bead, you have a running but **empty** Supabase — schema/data migration is the next bead (`pssh-yp3`).
+**Goal:** Clone the Supabase self-hosted compose stack, merge our generated secrets into its `.env` template, configure URLs so the LAN can reach Studio and the API at `http://10.0.0.85:8000`, pull all images, `docker compose up -d`, and verify every service is healthy. After this bead, you have a running but **empty** Supabase — schema/data migration is the next bead (`pssh-yp3`).
+
+> **Studio access**, briefly: Supabase's current self-hosted compose does **not** publish Studio on a host port. Studio runs internally on `studio:3000` inside the docker network, and Kong proxies `http://<host>:8000/` to it. The proxy is gated by HTTP Basic Auth using `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` (you'll get a browser credential dialog, not a styled login form). So the only host ports that matter LAN-side are **8000** (Kong → REST/Auth/Realtime/Storage/Studio), **8443** (Kong TLS, unused for us), **5432** and **6543** (Postgres pooler).
 
 ---
 
@@ -19,8 +21,8 @@ Supabase's [self-hosted compose stack](https://github.com/supabase/supabase/tree
 
 | Service | Container | Host port | Purpose |
 |---|---|---|---|
-| **Postgres** | `supabase-db` | `5432` | The database |
-| **Kong** | `supabase-kong` | `8000`, `8443` | API gateway — REST / Realtime / Auth / Storage all behind this |
+| **Postgres** | `supabase-db` | (internal — accessed via pooler) | The database |
+| **Kong** | `supabase-kong` | `8000`, `8443` | API gateway — REST / Realtime / Auth / Storage / Studio all behind this |
 | **GoTrue** | `supabase-auth` | (internal) | Auth service |
 | **PostgREST** | `supabase-rest` | (internal) | REST API auto-generated from Postgres schema |
 | **Realtime** | `realtime-dev.supabase-realtime` | (internal) | Websockets for `pg_listen` notifications |
@@ -28,14 +30,14 @@ Supabase's [self-hosted compose stack](https://github.com/supabase/supabase/tree
 | **imgproxy** | `supabase-imgproxy` | (internal) | On-the-fly image transformation |
 | **Edge Runtime** | `supabase-edge-functions` | (internal) | Deno runtime for Edge Functions |
 | **Postgres-Meta** | `supabase-meta` | (internal) | Postgres metadata API used by Studio |
-| **Studio** | `supabase-studio` | `3000` | Admin dashboard |
+| **Studio** | `supabase-studio` | (internal — reached via Kong on 8000) | Admin dashboard |
 | **Vector** | `supabase-vector` | (internal) | Logs aggregator into the analytics DB |
-| **Pooler** | `supabase-pooler` | `6543` | Supavisor connection pooler |
+| **Pooler** | `supabase-pooler` | `5432`, `6543` | Supavisor connection pooler — the only Postgres entry point from outside the docker network |
 | **Analytics** | `supabase-analytics` | (internal) | Logflare backend |
 
-LAN-reachable ports (post-bring-up): `3000` (Studio), `8000` (Kong = the actual API surface), `5432` (direct Postgres). UFW gets a rule for 3000 too, alongside the 22/8000/5432 from `pssh-cgj`.
+LAN-reachable ports (post-bring-up): `8000` (Kong — REST + Studio), `5432`/`6543` (Postgres via pooler). The UFW rules established in `pssh-cgj` cover these. **No port-3000 rule is needed** — Studio is not host-published.
 
-> Note on ports: Docker's iptables rules bypass UFW (see `docs/03_docker_install.md`), so any `-p X:X` published port is reachable from the LAN regardless of UFW. We add the UFW rule for 3000 anyway as documentation — `ufw status` reads as the canonical "what's exposed on this host."
+> Note on ports: Docker's iptables rules bypass UFW (see `docs/03_docker_install.md`), so any `-p X:X` published port is reachable from the LAN regardless of UFW. UFW rules are still useful as documentation — `ufw status` reads as the canonical "what's exposed on this host" — but they're not load-bearing for Docker-published ports.
 
 ---
 
@@ -107,8 +109,7 @@ sed -i "s|^SUPABASE_PUBLIC_URL=.*|SUPABASE_PUBLIC_URL=${PUBLIC_URL}|" ${COMPOSE_
 
 chmod 600 ${COMPOSE_DIR}/.env
 
-echo "==> 3/6 add UFW rule for Studio (port 3000)"
-sudo ufw allow from "${LAN_CIDR}" to any port 3000 proto tcp comment 'Supabase Studio admin (pssh-fj1)' || true
+echo "==> 3/6 (no UFW changes needed — Studio reached via Kong on 8000, already allowed in pssh-cgj)"
 
 echo "==> 4/6 docker compose pull (this takes a while — ~2 GB on first run)"
 cd ${COMPOSE_DIR}
@@ -121,9 +122,9 @@ echo "==> 6/6 wait for services to settle, then report"
 sleep 30
 docker compose ps
 echo ""
-echo "Studio:  http://10.0.0.85:3000   (login with DASHBOARD_USERNAME / DASHBOARD_PASSWORD from /opt/pss-supabase-host/.env)"
-echo "Kong:    http://10.0.0.85:8000   (API surface)"
-echo "Postgres: 10.0.0.85:5432         (direct connection; password is POSTGRES_PASSWORD from .env)"
+echo "Studio:   http://10.0.0.85:8000/  (HTTP Basic Auth — DASHBOARD_USERNAME / DASHBOARD_PASSWORD from /opt/pss-supabase-host/.env)"
+echo "Kong API: http://10.0.0.85:8000   (REST/Auth/Realtime/Storage — apps use ANON_KEY or SERVICE_ROLE_KEY in headers)"
+echo "Postgres: 10.0.0.85:5432          (via pooler; user 'postgres', password is POSTGRES_PASSWORD from .env)"
 VM
 ```
 
@@ -175,17 +176,19 @@ VM
 Then from your **dev workstation**:
 
 ```bash
-# Studio — open in a browser
-echo "Browse to: http://10.0.0.85:3000"
-# Username and password come from /opt/pss-supabase-host/.env on the VM:
+# Print the dashboard credentials (you'll need them for the Basic Auth dialog)
 ssh ubuntu@10.0.0.85 'grep -E "^DASHBOARD_(USERNAME|PASSWORD)=" /opt/pss-supabase-host/.env'
 
-# Kong reachability
+# Kong reachability — anonymous REST should be 401
 curl -sI --max-time 5 http://10.0.0.85:8000/rest/v1/ | head -3
 # Expect: HTTP/1.1 401 (unauthenticated REST call from LAN — proves Kong is reachable + Auth is enforcing)
+
+# Kong root — Basic Auth challenge for Studio
+curl -sI --max-time 5 http://10.0.0.85:8000/ | head -3
+# Expect: HTTP/1.1 401 with 'WWW-Authenticate: Basic realm="service"'
 ```
 
-Open `http://10.0.0.85:3000` in your browser, paste the dashboard creds, and you should land on Supabase Studio's project view. Empty schema, no tables yet — that's the next bead.
+Open `http://10.0.0.85:8000/` in your browser. The browser pops an OS-level **"Sign in to access this site"** dialog (HTTP Basic Auth — *not* a styled login form). Enter `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` and you'll land on Supabase Studio's project view. Empty schema, no tables yet — that's the next bead.
 
 ---
 
@@ -194,13 +197,12 @@ Open `http://10.0.0.85:3000` in your browser, paste the dashboard creds, and you
 - [ ] `docker compose ps` shows every service in `running` state, healthchecks `healthy` where defined
 - [ ] `curl -I http://10.0.0.85:8000/rest/v1/` returns `401` (Kong + Auth working)
 - [ ] `curl -I -H "apikey: <ANON>" http://10.0.0.85:8000/rest/v1/` returns `200`
-- [ ] Studio loads at `http://10.0.0.85:3000` from your dev workstation's browser
-- [ ] Login with `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` succeeds
+- [ ] `curl -I http://10.0.0.85:8000/` returns `401` with `WWW-Authenticate: Basic realm="service"` (Kong gates Studio)
+- [ ] Studio loads at `http://10.0.0.85:8000/` after passing the browser's Basic Auth dialog
 - [ ] You can run a SQL query in Studio's SQL Editor: `SELECT version();` returns Postgres ≥ 15
 - [ ] `/opt/pss-supabase-host/supabase-pinned-sha.txt` records the supabase commit SHA
-- [ ] UFW shows the new 3000 rule (`sudo ufw status | grep 3000`)
 
-When all eight are ✓, close the bead: `bd close pssh-fj1`. That unblocks both `pssh-yp3` (schema/data migration from cloud) and `pssh-2iy` (storage bucket sync) — they can be worked in parallel.
+When all seven are ✓, close the bead: `bd close pssh-fj1`. That unblocks `pssh-yp3` (schema/data migration), `pssh-2iy` (storage bucket sync), and `pssh-ryl` (backup runbook) — they can be worked in parallel.
 
 ---
 
@@ -212,9 +214,11 @@ When all eight are ✓, close the bead: `bd close pssh-fj1`. That unblocks both 
 
 **`supabase-db` is unhealthy** — usually permission or volume issue. `docker compose down -v` (the `-v` wipes volumes, full reset) and `docker compose up -d` again. **Note:** `-v` destroys data. Only do this before the migration in `pssh-yp3` lands real data.
 
-**Studio loads but shows "Failed to fetch"** — Studio is calling the API at `SUPABASE_PUBLIC_URL`. If you're hitting Studio at `http://10.0.0.85:3000` but `SUPABASE_PUBLIC_URL` is `http://localhost:8000`, browser CORS will block. Re-check that step 2 set both URLs to `http://10.0.0.85:8000`.
+**Studio loads but shows "Failed to fetch"** — Studio's frontend is calling the API at `SUPABASE_PUBLIC_URL`. If that's still `http://localhost:8000` (the supabase template default), browser CORS blocks the call from your dev workstation. Re-check that step 2 of the bring-up overrode `SUPABASE_PUBLIC_URL` and `API_EXTERNAL_URL` to `http://10.0.0.85:8000`.
 
-**Studio login fails with valid creds** — Studio's auth middleware reads `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` from the env at *container start*. If you changed them after `up -d`, restart Studio: `docker compose restart studio`.
+**Browser keeps asking for Basic Auth credentials in a loop** — the password the browser is sending doesn't match `DASHBOARD_PASSWORD` in `/opt/supabase/docker/.env`. Either you typed wrong, or Kong was started before the env was finalised. Restart Kong: `docker compose restart kong`. Then retry — clear the saved credentials in the browser if it cached the wrong ones (devtools → Application → Storage, or just use a private window).
+
+**Studio appears to load but is stuck on "Connecting…"** — usually `supabase-db` finished healthcheck but `supabase-meta` (which Studio queries) hasn't caught up. Wait 30 s; if persistent, `docker compose restart meta studio`.
 
 **Kong returns 502/504 to all routes** — one of the upstream services (auth, rest, realtime, storage) is down. `docker compose ps` will tell you which.
 
@@ -237,7 +241,6 @@ ssh ubuntu@10.0.0.85 bash <<'VM'
 cd /opt/supabase/docker
 docker compose down -v --remove-orphans
 sudo rm -rf /opt/supabase
-sudo ufw delete allow from 10.0.0.0/24 to any port 3000 || true
 VM
 ```
 
@@ -245,11 +248,22 @@ This puts you back to the state at the end of `pssh-9fi` — VM hardened, Docker
 
 ---
 
+## Cleanup if you followed an older revision of this doc
+
+An earlier revision added a UFW rule for port 3000 thinking Studio was directly host-published. It isn't (Studio runs on `studio:3000` inside the docker network only; Kong proxies on 8000). The rule does nothing harmful but is misleading — drop it:
+
+```bash
+ssh ubuntu@10.0.0.85 'sudo ufw delete allow from 10.0.0.0/24 to any port 3000 2>/dev/null || true'
+```
+
+---
+
 ## What's next
 
-Closing `pssh-fj1` unblocks two parallel beads:
+Closing `pssh-fj1` unblocks three parallel beads — they don't depend on each other and can be worked in any order:
 
-- **`pssh-yp3`** — `pg_dump` / `pg_restore` the public schema + auth.users from your existing cloud Supabase project into this self-hosted instance.
+- **`pssh-yp3`** — `pg_dump` / `pg_restore` the public schema + `auth.users` from the existing cloud Supabase project into this self-hosted instance.
 - **`pssh-2iy`** — Sync storage buckets from cloud to self-hosted.
+- **`pssh-ryl`** — Set up cron-driven `pg_dump` backups + tested restore procedure.
 
-Both feed into `pssh-y3s` (wire `platform-portal/.env` to the new instance and verify with one app), which is where you'll see a PSS standalone app actually running against this stack.
+`pssh-yp3` and `pssh-2iy` both feed into `pssh-y3s` (wire `platform-portal/.env` to the new instance and verify with one PSS app) — that's where you'll see a standalone app actually running against this stack. `pssh-ryl` is independent of those and can slot in whenever.
