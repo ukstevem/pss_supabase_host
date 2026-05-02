@@ -25,6 +25,15 @@ set -euo pipefail
 VM_HOST="${VM_HOST:-ubuntu@10.0.0.85}"
 ENV_FILE="${ENV_FILE:-.env.cloud}"
 
+# If JUMP_HOST is set (e.g. JUMP_HOST=root@10.0.0.84 when on VPN with a
+# non-LAN source IP), bounce all ssh through it. UFW on the VM gates
+# port 22 to 10.0.0.0/24 source; the jump host is on that subnet so
+# its outbound to the VM passes UFW.
+SSH_OPTS=()
+if [[ -n "${JUMP_HOST:-}" ]]; then
+  SSH_OPTS+=(-J "${JUMP_HOST}")
+fi
+
 # --- parse args ---
 SKIP_CONFIRM=0
 for arg in "$@"; do
@@ -74,15 +83,19 @@ if [[ "${VM_HOST}" == *"supabase.co"* ]] || [[ "${VM_HOST}" == *"pooler.supabase
 fi
 
 # Test SSH
-if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${VM_HOST}" "echo OK" >/dev/null 2>&1; then
+if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes "${VM_HOST}" "echo OK" >/dev/null 2>&1; then
   echo "  FAIL: cannot ssh to ${VM_HOST}. Check SSH keys + LAN."
+  if [[ -z "${JUMP_HOST:-}" ]]; then
+    echo "        On VPN with a non-LAN source IP? Set JUMP_HOST and retry:"
+    echo "          JUMP_HOST=root@10.0.0.84 ./scripts/resync.sh"
+  fi
   exit 1
 fi
 echo "  ssh ${VM_HOST}: OK"
 
 # Test cloud DB reachability from the VM
 echo "  cloud DB reach: testing..."
-if ssh "${VM_HOST}" "PGPASSWORD='${CLOUD_DB_PASSWORD}' psql 'host=db.${CLOUD_PROJECT_REF}.supabase.co port=5432 user=postgres dbname=postgres sslmode=require connect_timeout=10' -tAc 'SELECT 1' 2>/dev/null | grep -q '^1$'"; then
+if ssh "${SSH_OPTS[@]}" "${VM_HOST}" "PGPASSWORD='${CLOUD_DB_PASSWORD}' psql 'host=db.${CLOUD_PROJECT_REF}.supabase.co port=5432 user=postgres dbname=postgres sslmode=require connect_timeout=10' -tAc 'SELECT 1' 2>/dev/null | grep -q '^1$'"; then
   echo "  cloud DB reach: OK"
 else
   echo "  FAIL: cannot reach cloud DB from ${VM_HOST}."
@@ -116,7 +129,7 @@ fi
 # --- step 1: dump ---
 echo ""
 echo "==> step 1/3: dump from cloud"
-ssh "${VM_HOST}" \
+ssh "${SSH_OPTS[@]}" "${VM_HOST}" \
   "PGPASSWORD='${CLOUD_DB_PASSWORD}' CLOUD_PROJECT_REF='${CLOUD_PROJECT_REF}' EXTRA_SCHEMAS='${EXTRA_SCHEMAS:-}' bash" <<'VM'
 set -euo pipefail
 DUMP_DIR=/opt/pss-supabase-host/migration
@@ -161,7 +174,7 @@ echo "==> step 2/3: restore on self-hosted"
 
 # Wipe public schema completely. Cascades drop all public tables/funcs/policies.
 echo "  drop public schema..."
-ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U postgres -d postgres -c "DROP SCHEMA public CASCADE;" 2>&1 | tail -1'
+ssh "${SSH_OPTS[@]}" "${VM_HOST}" 'docker exec -i supabase-db psql -U postgres -d postgres -c "DROP SCHEMA public CASCADE;" 2>&1 | tail -1'
 
 # Wipe the auth.* tables we'll be reloading. Without this, auth.sql's COPY
 # hits duplicate-key conflicts on re-runs (auth.users keeps rows from the
@@ -169,20 +182,20 @@ ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U postgres -d postgres -c "DR
 # resets sequence values; CASCADE handles any cross-schema FKs from the
 # supabase-managed schemas (storage etc.).
 echo "  truncate auth tables..."
-ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -c "TRUNCATE auth.users, auth.identities, auth.sessions, auth.refresh_tokens RESTART IDENTITY CASCADE;" 2>&1 | tail -1'
+ssh "${SSH_OPTS[@]}" "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -c "TRUNCATE auth.users, auth.identities, auth.sessions, auth.refresh_tokens RESTART IDENTITY CASCADE;" 2>&1 | tail -1'
 
 echo "  schema..."
-ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/schema.sql 2>&1 | grep -E "^ERROR" | head -5 || true'
+ssh "${SSH_OPTS[@]}" "${VM_HOST}" 'docker exec -i supabase-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/schema.sql 2>&1 | grep -E "^ERROR" | head -5 || true'
 echo "  auth (as supabase_admin)..."
-ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/auth.sql 2>&1 | grep -E "^ERROR" | head -5 || true'
+ssh "${SSH_OPTS[@]}" "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/auth.sql 2>&1 | grep -E "^ERROR" | head -5 || true'
 echo "  data (as supabase_admin)..."
-ssh "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/data.sql 2>&1 | grep -E "^ERROR" | head -5 || true'
+ssh "${SSH_OPTS[@]}" "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/data.sql 2>&1 | grep -E "^ERROR" | head -5 || true'
 
 # --- step 3: verify ---
 echo ""
 echo "==> step 3/3: row counts (from TABLES in .env.cloud)"
 
-ssh "${VM_HOST}" "TABLES='${TABLES:-auth.users}' bash" <<'VM'
+ssh "${SSH_OPTS[@]}" "${VM_HOST}" "TABLES='${TABLES:-auth.users}' bash" <<'VM'
 set -euo pipefail
 printf "%-35s %15s\n" "Table" "Rows"
 printf "%-35s %15s\n" "-----" "----"

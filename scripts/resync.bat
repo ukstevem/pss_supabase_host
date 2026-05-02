@@ -66,7 +66,12 @@ echo Using bash: %GIT_BASH%
 echo Repo root:  %CD%
 echo.
 
-"%GIT_BASH%" -c "./scripts/resync.sh --yes-i-am-sure"
+REM JUMP_HOST: set to your jump host (e.g. root@10.0.0.84) if you're on
+REM VPN and your source IP isn't 10.0.0.x. Leave empty when on the LAN
+REM directly. The bash script picks it up via env.
+set "JUMP_HOST="
+
+"%GIT_BASH%" -c "JUMP_HOST='%JUMP_HOST%' ./scripts/resync.sh --yes-i-am-sure"
 set "RC=%ERRORLEVEL%"
 
 echo.

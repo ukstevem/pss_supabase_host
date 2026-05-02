@@ -16,14 +16,24 @@ set -euo pipefail
 VM_HOST="${VM_HOST:-ubuntu@10.0.0.85}"
 VM_IP="${VM_HOST##*@}"
 
+# If JUMP_HOST is set (e.g. JUMP_HOST=root@10.0.0.84 when on VPN), bounce
+# all ssh through it. Useful when UFW on the VM blocks your current source
+# IP but you have access to the LAN's Proxmox host.
+SSH_OPTS=(-o ConnectTimeout=5)
+if [[ -n "${JUMP_HOST:-}" ]]; then
+  SSH_OPTS+=(-J "${JUMP_HOST}")
+fi
+
 # Pull a single key=value from the merged supabase env on the VM.
 get() {
-  ssh -o ConnectTimeout=5 "${VM_HOST}" "grep -E '^${1}=' /opt/supabase/docker/.env | head -1 | sed 's/^${1}=//'"
+  ssh "${SSH_OPTS[@]}" "${VM_HOST}" "grep -E '^${1}=' /opt/supabase/docker/.env | head -1 | sed 's/^${1}=//'"
 }
 
 # Pre-flight: confirm we can ssh
-if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${VM_HOST}" "echo OK" >/dev/null 2>&1; then
+if ! ssh "${SSH_OPTS[@]}" -o BatchMode=yes "${VM_HOST}" "echo OK" >/dev/null 2>&1; then
   echo "ERROR: cannot ssh to ${VM_HOST}" >&2
+  echo "       If you're on VPN and your source IP isn't 10.0.0.x, set JUMP_HOST:" >&2
+  echo "         JUMP_HOST=root@10.0.0.84 ./scripts/print_connections.sh" >&2
   exit 1
 fi
 
