@@ -191,6 +191,14 @@ ssh "${SSH_OPTS[@]}" "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_a
 echo "  data (as supabase_admin)..."
 ssh "${SSH_OPTS[@]}" "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 < /opt/pss-supabase-host/migration/data.sql 2>&1 | grep -E "^ERROR" | head -5 || true'
 
+# Re-apply standard Supabase role grants on public. pg_dump --no-privileges
+# strips these; without them PostgREST returns 403 silently because anon /
+# authenticated / service_role have no SELECT on the migrated tables.
+echo "  apply standard supabase grants..."
+ssh "${SSH_OPTS[@]}" "${VM_HOST}" 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1' \
+  < scripts/sql/post_restore_grants.sql \
+  2>&1 | grep -E "^ERROR" | head -5 || true
+
 # --- step 3: verify ---
 echo ""
 echo "==> step 3/3: row counts (from TABLES in .env.cloud)"

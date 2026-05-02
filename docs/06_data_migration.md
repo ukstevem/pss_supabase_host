@@ -241,6 +241,25 @@ Common errors and how to read them:
 - `violates foreign key constraint "<...>_user_id_fkey"` — auth.users hadn't been loaded yet. Re-run in the C-then-D order shown above.
 - `extension "<x>" is not available` — cloud DB has an extension self-hosted doesn't. `docker exec supabase-db psql -U postgres -c '\dx'` shows what's installed; install the missing one on self-hosted before retrying.
 
+### Step E: re-apply standard Supabase role grants
+
+**Critical** — without this step, PostgREST returns `403 Forbidden` silently on every REST call. Studio still works (it connects as `supabase_admin`), but apps using the `anon` / `authenticated` / `service_role` keys can't see anything.
+
+Why: `pg_dump --no-privileges` strips ALL grant statements, including the standard `GRANT TO anon, authenticated, service_role` lines that Supabase's init normally applies on a fresh install. Restore brings back tables/functions but with no API-role permissions on them.
+
+Run after step D:
+
+```bash
+cat scripts/sql/post_restore_grants.sql \
+  | ssh ubuntu@10.0.0.85 'docker exec -i supabase-db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1'
+```
+
+(With `JUMP_HOST=root@10.0.0.84` prefix if on VPN.)
+
+The script GRANTs `USAGE` on the `public` schema and `ALL` on all tables / sequences / functions to the three Supabase API roles, plus sets `ALTER DEFAULT PRIVILEGES` so future objects you create in `public` (e.g. via Studio) also get the grants automatically.
+
+`scripts/resync.sh` applies this automatically as the final step of its restore phase since 2026-05-02.
+
 ---
 
 ## 5. Verify
