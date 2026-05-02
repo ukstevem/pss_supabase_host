@@ -151,6 +151,18 @@ Manually merge the rotated values into `/opt/pss-supabase-host/.env`. ANON_KEY /
 
 **Why JWT_SECRET rotation cascades:** the apps embed the ANON_KEY at *build time* (`--build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=...` per `docs/SKILL_pss_standalone_app.md`). Rotating JWT_SECRET produces a new ANON_KEY, which means the running app's baked-in key no longer signs valid for the new instance. Rebuild required.
 
+### Post-rotation checklist (especially for full rotation)
+
+After rotating self-hosted secrets, the new values must propagate to anywhere they're consumed:
+
+- [ ] **Self-hosted stack restart**: `cd /opt/supabase/docker && docker compose down && docker compose up -d` so the running services reload `.env`.
+- [ ] **Regenerate `connections.md`** on your dev workstation: `./scripts/print_connections.sh > connections.md` (with `JUMP_HOST=root@10.0.0.84` if on VPN). This pulls live values fresh.
+- [ ] **Update `platform-portal/.env.development`** (or whatever the dev env file is called there) with the new ANON_KEY / SERVICE_ROLE_KEY / SUPABASE_URL from `connections.md`. **Cloud (`platform-portal/.env.production`) is unaffected by self-hosted rotations** — different secrets, different lifecycle.
+- [ ] **Rebuild any PSS standalone app images that point at self-hosted** (only the dev images — production images keep cloud keys). Per `docs/SKILL_pss_standalone_app.md`, rebuild via `docker buildx build --platform linux/arm64 --build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=...` with the new key.
+- [ ] **Note the rotation in bd**: `bd note pssh-9fi "rotated YYYY-MM-DD because <reason>"` for audit trail.
+
+If you skip the platform-portal step, dev images built before rotation will fail auth against self-hosted (the JWT signature won't validate against the new secret).
+
 ---
 
 ## Rollback

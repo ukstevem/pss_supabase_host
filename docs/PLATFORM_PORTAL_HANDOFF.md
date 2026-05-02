@@ -92,6 +92,15 @@ Look at platform-portal as it stands today and propose a clean approach for:
 4. Documenting the new flow in the platform-portal repo so other devs know which
    env they're hitting in dev vs prod, and how to flip between them locally if
    they need to test against cloud explicitly (rare, but possible).
+5. **Post-rotation refresh** — when self-hosted credentials are rotated (via
+   the `scripts/gen_secrets.py` flow in `pss-supabase-host`), the rotated
+   `ANON_KEY` / `SERVICE_ROLE_KEY` / `JWT_SECRET` invalidate any app already
+   built against the old values. The dev `.env.development` here in platform-portal
+   must be regenerated from `connections.md` (produced by
+   `pss-supabase-host/scripts/print_connections.sh`), and any dev images already
+   built against old keys must be rebuilt. Document this dependency clearly in
+   platform-portal's README so it doesn't surprise anyone. Cloud rotation is
+   independent — different keys, different rotation cadence.
 
 # Process
 
